@@ -154,6 +154,24 @@ void FileLoader::clearLocalCache()
     SharedFiles::clear();
 }
 
+void FileLoader::cleanupStaleTmpFiles()
+{
+    for (const auto& dir : { conf.functionDir, conf.objectFileDir }) {
+        if (!std::filesystem::exists(dir)) {
+            continue;
+        }
+        for (const auto& entry :
+             std::filesystem::recursive_directory_iterator(dir)) {
+            const auto& p = entry.path();
+            if (p.extension().empty() &&
+                p.filename().string().find(".tmp.") != std::string::npos) {
+                SPDLOG_DEBUG("Removing stale tmp file: {}", p.string());
+                std::filesystem::remove(p);
+            }
+        }
+    }
+}
+
 // -------------------------------------
 // SHARED LOAD/ UPLOAD
 // -------------------------------------
@@ -187,7 +205,18 @@ std::vector<uint8_t> FileLoader::loadFileBytes(
                      conf.s3Bucket,
                      pathCopy,
                      localCachePath);
-        writeBytesToFile(localCachePath, bytes);
+        // Write to a thread-unique temp file then atomically rename into place.
+        // This prevents other threads from reading a partially-written cache
+        // file (which causes "unexpect end" errors in wasm_runtime_load).
+        std::string tmpPath =
+          localCachePath + ".tmp." + std::to_string(gettid());
+        try {
+            writeBytesToFile(tmpPath, bytes);
+            std::filesystem::rename(tmpPath, localCachePath);
+        } catch (...) {
+            std::filesystem::remove(tmpPath);
+            throw;
+        }
     }
 
     return bytes;

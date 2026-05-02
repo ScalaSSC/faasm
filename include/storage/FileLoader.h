@@ -32,6 +32,8 @@ class FileLoader
 
     void clearLocalCache();
 
+    void cleanupStaleTmpFiles();
+
     std::string getHashFilePath(const std::string& path);
 
     // ----- Function wasm -----
