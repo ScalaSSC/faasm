@@ -208,14 +208,22 @@ std::vector<uint8_t> FileLoader::loadFileBytes(
         // Write to a thread-unique temp file then atomically rename into place.
         // This prevents other threads from reading a partially-written cache
         // file (which causes "unexpect end" errors in wasm_runtime_load).
+        // The cache write may race with a concurrent clearLocalCache (triggered
+        // by a Flush). If that happens, we skip caching and return bytes as-is.
         std::string tmpPath =
           localCachePath + ".tmp." + std::to_string(gettid());
         try {
+            std::filesystem::create_directories(
+              std::filesystem::path(localCachePath).parent_path());
             writeBytesToFile(tmpPath, bytes);
             std::filesystem::rename(tmpPath, localCachePath);
-        } catch (...) {
-            std::filesystem::remove(tmpPath);
-            throw;
+        } catch (const std::exception& e) {
+            SPDLOG_WARN("Failed to cache {} ({}), using in-memory bytes",
+                        localCachePath,
+                        e.what());
+            try {
+                std::filesystem::remove(tmpPath);
+            } catch (...) {}
         }
     }
 
