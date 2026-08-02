@@ -20,7 +20,7 @@ spec:
             - control
   containers:
     - name: planner
-      image: tqiunimelb/planner:0.1.37
+      image: tqiunimelb/planner:0.1.38
       ports:
         - containerPort: 8081
       env:
