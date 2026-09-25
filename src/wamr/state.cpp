@@ -284,61 +284,6 @@ std::set<std::string> splitStringToSet(const std::string& str,
     return resultSet;
 }
 
-// static int32_t __faasm_read_indiv_function_state_size_lock_wrapper(
-//   wasm_exec_env_t exec_env,
-//   const char* inputKeys,
-//   char* lockedKeys)
-// {
-//     GET_USER_FUNC_PAR();
-
-//     faabric::state::State& state = faabric::state::getGlobalState();
-
-//     std::string inputStr(inputKeys);
-
-//     // Lock first, then read size.
-//     std::string delimiter = "|";
-//     std::set<std::string> inputKeysSet = splitStringToSet(inputStr,
-//     delimiter);
-
-//     int acquireTimes = ExecutorContext::get()->incrementLockAcquireTimes();
-
-//     SPDLOG_DEBUG("S - faasm_read_indiv_function_state_size_lock - {}/{}-{} "
-//                  "inputKeys {} - {} times",
-//                  user,
-//                  func,
-//                  parallelismId,
-//                  inputKeys,
-//                  acquireTimes);
-
-//     auto size =
-//       state.getIndivFuncStateSizeLock(user,
-//                                       func,
-//                                       parallelismId,
-//                                       reinterpret_cast<uint8_t*>(lockedKeys),
-//                                       inputKeysSet,
-//                                       acquireTimes);
-//     return size;
-// }
-
-// static long __faasm_read_indiv_function_state_wrapper(wasm_exec_env_t
-// exec_env,
-//                                                       char* buffer,
-//                                                       int32_t bufferLen,
-//                                                       char* inputKeys)
-// {
-//     GET_USER_FUNC_PAR();
-
-//     faabric::state::State& state = faabric::state::getGlobalState();
-//     // Split input keys from string into set
-//     std::string inputStr(inputKeys);
-//     // Lock first, then read size.
-//     std::string delimiter = "|";
-//     std::set<std::string> inputKeysSet = splitStringToSet(inputStr,
-//     delimiter); state.readIndivFuncState(
-//       user, func, parallelismId, buffer, bufferLen, inputKeysSet);
-//     return 0;
-// }
-
 static int32_t __faasm_read_indiv_function_state_ptr_wrapper(
   wasm_exec_env_t exec_env,
   const char* inputKeys)

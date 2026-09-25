@@ -78,6 +78,9 @@ int makeChainedCall(const std::string& functionName,
     msg.set_inputdata(inputData.data(), inputData.size());
     msg.set_funcptr(wasmFuncPtr);
     msg.set_chainedid(originalCall->chainedid());
+    // Descends from the same input, so it is ranked by that input's arrival
+    msg.set_inputarrivaltime(originalCall->inputarrivaltime());
+    msg.set_inputseq(originalCall->inputseq());
 
     // Propagate the command line if needed
     msg.set_cmdline(originalCall->cmdline());
@@ -175,6 +178,10 @@ int makeChainedCallBatch()
         msg.set_inputdata(inputData.data(), inputData.size());
         msg.set_funcptr(0);
         msg.set_chainedid(originalCall->chainedid());
+        // Descends from the same input, so it is ranked by that input's
+        // arrival
+        msg.set_inputarrivaltime(originalCall->inputarrivaltime());
+        msg.set_inputseq(originalCall->inputseq());
 
         // Propagate the command line if needed
         msg.set_cmdline(originalCall->cmdline());
