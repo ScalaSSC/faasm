@@ -53,7 +53,7 @@ int makeChainedCall(const std::string& functionName,
           faabric::executor::ExecutorContext::get();
         context->chainedFunctionName.push_back(functionName);
         context->chainedMsgId.push_back(msgIdx);
-        context->chainedInput.push_back(inputData);
+        context->chainedInput.emplace_back(inputData.begin(), inputData.end());
         // We record the number of chained calls messages in original call
         // originalCall = &context->getBatch().mutable_messages()->at(msgIdx);
         // originalCall->set_chainedmsgnum(originalCall->chainedmsgnum() + 1);
@@ -137,9 +137,11 @@ int makeChainedCallBatch()
     SPDLOG_TRACE("S - chained_call_back_invoke");
     std::shared_ptr<faabric::executor::ExecutorContext> context =
       faabric::executor::ExecutorContext::get();
-    std::vector<std::string> chainedFunctionName = context->chainedFunctionName;
-    std::vector<int> chainedMsgId = context->chainedMsgId;
-    std::vector<std::vector<uint8_t>> chainedInput = context->chainedInput;
+    // Taken, not copied: the context is cleared of them below either way.
+    std::vector<std::string> chainedFunctionName =
+      std::move(context->chainedFunctionName);
+    std::vector<int> chainedMsgId = std::move(context->chainedMsgId);
+    std::vector<std::string> chainedInput = std::move(context->chainedInput);
     // The size of chainedFunctionName, chainedMsgId and chainedInput should be
     // the same
     if (chainedFunctionName.size() == 0) {
@@ -156,7 +158,6 @@ int makeChainedCallBatch()
     for (size_t i = 0; i < chainedMsgId.size(); i++) {
         std::string functionName = chainedFunctionName.at(i);
         int msgIdx = chainedMsgId.at(i);
-        const std::vector<uint8_t>& inputData = chainedInput.at(i);
 
         // Get the original call
         faabric::Message* originalCall =
@@ -175,7 +176,6 @@ int makeChainedCallBatch()
           faabric::util::messageFactory(user, functionName);
         msg.set_appid(appId);
         // Propagate chaining-specific fields
-        msg.set_inputdata(inputData.data(), inputData.size());
         msg.set_funcptr(0);
         msg.set_chainedid(originalCall->chainedid());
         // Descends from the same input, so it is ranked by that input's
@@ -207,16 +207,20 @@ int makeChainedCallBatch()
                      msg.id());
 
         // Record the chained call in the executor before invoking the new
-        // functions to avoid data races
+        // functions to avoid data races. The record only serves result
+        // lookups, which go by id, so it is taken before the input goes in.
         faabric::executor::ExecutorContext::get()
           ->getExecutor()
           ->addChainedMessage(msg);
+
+        msg.set_inputdata(std::move(chainedInput.at(i)));
 
         if (originalCall->recordexecgraph()) {
             faabric::util::logChainedFunction(*originalCall, msg);
         }
 
-        chainedMessages.emplace_back(std::make_unique<faabric::Message>(msg));
+        chainedMessages.emplace_back(
+          std::make_unique<faabric::Message>(std::move(msg)));
     }
 
     // clear the context
