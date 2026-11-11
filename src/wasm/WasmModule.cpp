@@ -504,7 +504,14 @@ int32_t WasmModule::executeBatchTask(
     }
 
     SPDLOG_TRACE("Executing {} as batch standard function", funcStr);
+    // The CPU time this thread spends in the function, over the same span as
+    // workerExecuteStart..End: the rest of that span is waiting.
+    int64_t startCpuNs = faabric::util::getCpuTimeNano();
     returnValue = executeBatchFunction(*req);
+    int64_t endCpuNs = faabric::util::getCpuTimeNano();
+    int64_t cpuMicros = startCpuNs >= 0 && endCpuNs >= startCpuNs
+                          ? (endCpuNs - startCpuNs) / 1000
+                          : 0;
 
     // Set result and timestamp
     long endTime = faabric::util::getGlobalClock().epochMillis();
@@ -512,6 +519,7 @@ int32_t WasmModule::executeBatchTask(
     for (int i = 0; i < req->messages_size(); i++) {
         req->mutable_messages(i)->set_finishtimestamp(endTime);
         req->mutable_messages(i)->set_workerexecuteend(endMicros);
+        req->mutable_messages(i)->set_workerexecutecputime(cpuMicros);
         req->mutable_messages(i)->set_returnvalue(returnValue);
         if (returnValue != 0) {
             req->mutable_messages(i)->set_outputdata(

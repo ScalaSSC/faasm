@@ -1,3 +1,5 @@
+#include <faabric/executor/Executor.h>
+#include <faabric/scheduler/Scheduler.h>
 #include <faabric/util/files.h>
 #include <faabric/util/locks.h>
 #include <faabric/util/logging.h>
@@ -8,15 +10,20 @@
 #include <wasm/WasmExecutionContext.h>
 #include <wasm/WasmModule.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <cstdint>
+#include <cstring>
 #include <setjmp.h>
 #include <stdexcept>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <aot_runtime.h>
 #include <wasm_export.h>
+#include <wasm_memory.h>
 #include <wasm_runtime_common.h>
 
 #define FAASM_WAMR_NUM_MAX_THREADS 200
@@ -43,6 +50,24 @@ static std::mutex wamrGlobalsMutex;
  * destroyed after that. Failing to destroy it will create memory leaks in
  * TLS, leading to hard-to-debug segmentation faults.
  */
+// Light reset: a thread's WAMR environment, once set up, is kept until the
+// thread exits instead of being torn down after every call. Setting it up
+// maps a signal stack, protects stack guard pages and installs signal
+// handlers -- process-wide operations that queue on the memory-map lock and
+// the signal lock with every other executor's.
+struct WAMRThreadEnvKeeper
+{
+    bool kept = false;
+
+    ~WAMRThreadEnvKeeper()
+    {
+        if (kept && wamrInitialised && wasm_runtime_thread_env_inited()) {
+            wasm_runtime_destroy_thread_env();
+        }
+    }
+};
+static thread_local WAMRThreadEnvKeeper threadEnvKeeper;
+
 class WAMRThreadEnv
 {
   public:
@@ -57,9 +82,14 @@ class WAMRThreadEnv
 
     ~WAMRThreadEnv()
     {
+        if (faabric::executor::lightResetEnabled()) {
+            threadEnvKeeper.kept = true;
+            return;
+        }
         if (wasm_runtime_thread_env_inited()) {
             wasm_runtime_destroy_thread_env();
         }
+        threadEnvKeeper.kept = false;
     }
 };
 
@@ -154,9 +184,165 @@ void WAMRWasmModule::reset(faabric::Message& msg,
     std::string funcStr = faabric::util::funcToString(msg, true);
     SPDLOG_DEBUG("WAMR resetting after {} (snap key {})", funcStr, snapshotKey);
 
+    // Light reset: put the instance back in place. Re-instantiating maps a
+    // fresh 8 GiB linear memory and unmaps the old one on every request,
+    // and those mappings queue on the process-wide memory-map lock with
+    // every other executor's -- and so do the page faults of the ones
+    // running meanwhile. Restoring touches no mapping.
+    if (faabric::executor::lightResetEnabled() && tryLightReset()) {
+        faabric::scheduler::getScheduler().countLightReset();
+        return;
+    }
+
     destroyThreadsExecEnv(true);
     wasm_runtime_deinstantiate(moduleInstance);
     bindInternal(msg);
+}
+
+void WAMRWasmModule::captureCleanImage()
+{
+    cleanImage = CleanImage{};
+
+    auto* inst = reinterpret_cast<AOTModuleInstance*>(moduleInstance);
+    // One private memory, as AOT modules have; anything else re-instantiates.
+    if (inst->memory_count != 1 || inst->memories == nullptr) {
+        return;
+    }
+    AOTMemoryInstance* mem = inst->memories[0];
+    if (mem == nullptr || mem->is_shared_memory ||
+        mem->memory_data == nullptr) {
+        return;
+    }
+
+    // Memory up to its last non-zero page: the rest of a fresh instance's
+    // memory is zero, and a reset can zero it by dropping its pages.
+    const uint64_t pageSize = static_cast<uint64_t>(getpagesize());
+    const uint64_t memorySize = mem->memory_data_size;
+    const uint8_t* base = mem->memory_data;
+    uint64_t usedBytes = 0;
+    for (uint64_t offset = 0; offset < memorySize; offset += pageSize) {
+        uint64_t length = std::min(pageSize, memorySize - offset);
+        const uint8_t* page = base + offset;
+        bool zero =
+          page[0] == 0 && std::memcmp(page, page + 1, length - 1) == 0;
+        if (!zero) {
+            usedBytes = offset + length;
+        }
+    }
+    cleanImage.memory.assign(base, base + usedBytes);
+    cleanImage.memorySize = memorySize;
+    cleanImage.pageCount = mem->cur_page_count;
+    cleanImage.bytesPerPage = mem->num_bytes_per_page;
+    cleanImage.maxPageCount = mem->max_page_count;
+
+    if (inst->global_data != nullptr && inst->global_data_size > 0) {
+        cleanImage.globals.assign(inst->global_data,
+                                  inst->global_data + inst->global_data_size);
+    }
+    for (uint32_t i = 0; i < inst->table_count; i++) {
+        AOTTableInstance* table = inst->tables[i];
+        if (table == nullptr) {
+            return;
+        }
+        cleanImage.tables.emplace_back(table->elems,
+                                       table->elems + table->cur_size);
+    }
+
+    cleanImage.valid = true;
+    SPDLOG_DEBUG("WAMR clean image of {}/{}: {} of {} memory bytes, {} global "
+                 "bytes, {} tables",
+                 boundUser,
+                 boundFunction,
+                 usedBytes,
+                 memorySize,
+                 cleanImage.globals.size(),
+                 cleanImage.tables.size());
+}
+
+bool WAMRWasmModule::tryLightReset()
+{
+    if (!cleanImage.valid || moduleInstance == nullptr) {
+        return false;
+    }
+    auto* inst = reinterpret_cast<AOTModuleInstance*>(moduleInstance);
+    AOTMemoryInstance* mem = inst->memories[0];
+
+    // A memory that grew is shrunk back below (it keeps its pages mapped);
+    // anything else of another shape re-instantiates.
+    if (mem->cur_page_count < cleanImage.pageCount ||
+        mem->memory_data_size < cleanImage.memorySize ||
+        mem->num_bytes_per_page != cleanImage.bytesPerPage ||
+        mem->max_page_count != cleanImage.maxPageCount ||
+        inst->global_data_size != cleanImage.globals.size() ||
+        inst->table_count != cleanImage.tables.size()) {
+        return false;
+    }
+    for (uint32_t i = 0; i < inst->table_count; i++) {
+        if (inst->tables[i]->cur_size != cleanImage.tables[i].size()) {
+            return false;
+        }
+    }
+    // A run that trapped may have left the instance anywhere; only a normal
+    // return or exit is put back in place.
+    const char* exception = wasm_runtime_get_exception(moduleInstance);
+    if (exception != nullptr && std::string(exception) != WASI_PROC_EXIT) {
+        return false;
+    }
+
+    // Memory: what was non-zero copied back, the rest -- grown pages too --
+    // zeroed by dropping its pages (they fault back in as zero pages).
+    // Neither changes a mapping.
+    uint8_t* base = mem->memory_data;
+    uint64_t copied = cleanImage.memory.size();
+    uint64_t usedSize = mem->memory_data_size;
+    if (copied > 0) {
+        std::memcpy(base, cleanImage.memory.data(), copied);
+    }
+    if (copied < usedSize &&
+        madvise(base + copied, usedSize - copied, MADV_DONTNEED) != 0) {
+        SPDLOG_WARN("WAMR light reset of {}/{} could not drop pages ({}), "
+                    "re-instantiating",
+                    boundUser,
+                    boundFunction,
+                    errno);
+        return false;
+    }
+
+    // A memory that grew goes back to its first size. Its grown pages stay
+    // readable and writable, so that growing again only re-protects them as
+    // they are -- unmapping them would take the memory-map lock for longer
+    // -- and access beyond the size does not trap there until the instance
+    // is re-instantiated: fine for trusted functions, not as isolation.
+    if (usedSize > cleanImage.memorySize) {
+        mem->cur_page_count = cleanImage.pageCount;
+        SET_LINEAR_MEMORY_SIZE(mem,
+                               static_cast<uint32_t>(cleanImage.memorySize));
+        mem->memory_data_end = base + cleanImage.memorySize;
+        wasm_runtime_set_mem_bound_check_bytes(mem, cleanImage.memorySize);
+    }
+
+    // Globals (the stack pointer among them) and tables.
+    if (!cleanImage.globals.empty()) {
+        std::memcpy(inst->global_data,
+                    cleanImage.globals.data(),
+                    cleanImage.globals.size());
+    }
+    for (uint32_t i = 0; i < inst->table_count; i++) {
+        const auto& elems = cleanImage.tables[i];
+        if (!elems.empty()) {
+            std::memcpy(inst->tables[i]->elems,
+                        elems.data(),
+                        elems.size() * sizeof(uint32_t));
+        }
+    }
+
+    // The host side of the run: any threads' environments, the exit and the
+    // exit code. The main thread's environment is kept, as WAMR allows.
+    destroyThreadsExecEnv(false);
+    wasm_runtime_clear_exception(moduleInstance);
+    wasm_runtime_get_wasi_ctx(moduleInstance)->exit_code = 0;
+    currentBrk.store(getMemorySizeBytes(), std::memory_order_release);
+    return true;
 }
 
 void WAMRWasmModule::doBindToFunction(faabric::Message& msg, bool cache)
@@ -286,6 +472,11 @@ void WAMRWasmModule::bindInternal(faabric::Message& msg)
       wasm_runtime_create_exec_env(moduleInstance, STACK_SIZE_KB);
     if (execEnvs.at(0) == nullptr) {
         SPDLOG_ERROR("Error allocating execution environment for main thread!");
+    }
+
+    // Fresh, and nothing has run yet: what a light reset puts back.
+    if (faabric::executor::lightResetEnabled() && !cleanImage.valid) {
+        captureCleanImage();
     }
 }
 

@@ -132,6 +132,33 @@ class WAMRWasmModule final
     void bindInternal(faabric::Message& msg);
 
     bool doGrowMemory(uint32_t pageChange) override;
+
+    // Light reset (faabric::executor::lightResetEnabled): the instance as it
+    // was right after instantiation -- linear memory up to its last non-zero
+    // page (the rest was zero), memory size, global data and tables -- so
+    // that a reset can put it back in place instead of re-instantiating the
+    // module. Taken once, on the first instantiation with light reset on:
+    // every instance of the module starts out the same.
+    struct CleanImage
+    {
+        bool valid = false;
+        std::vector<uint8_t> memory;
+        uint64_t memorySize = 0;
+        uint32_t pageCount = 0;
+        uint32_t bytesPerPage = 0;
+        uint32_t maxPageCount = 0;
+        std::vector<uint8_t> globals;
+        std::vector<std::vector<uint32_t>> tables;
+    };
+    CleanImage cleanImage;
+
+    void captureCleanImage();
+
+    // Puts the instance back as captured -- a memory that grew shrunk back
+    // to its first size -- or returns false, having changed nothing that
+    // matters, if it cannot: no image, a table that changed size, or a run
+    // that ended in an exception other than a normal exit.
+    bool tryLightReset();
 };
 
 WAMRWasmModule* getExecutingWAMRModule();
