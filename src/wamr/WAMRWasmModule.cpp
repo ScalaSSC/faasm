@@ -14,6 +14,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <setjmp.h>
 #include <stdexcept>
 #include <stdio.h>
@@ -34,6 +35,93 @@ namespace wasm {
 // https://github.com/bytecodealliance/wasm-micro-runtime/blob/main/core/iwasm/include/wasm_export.h
 static bool wamrInitialised = false;
 const std::string WASI_PROC_EXIT = "Exception: wasi proc exit";
+
+// Light reset: how much of the zero part of linear memory -- the stack, the
+// heap, memory that grew -- a reset keeps resident, zeroing what the run
+// wrote in place. Beyond it written pages are dropped, and fault back in as
+// zero pages when touched again.
+static constexpr uint64_t LIGHT_RESET_KEEP_BYTES = 1024 * 1024;
+
+static bool isZeroBytes(const uint8_t* bytes, uint64_t length)
+{
+    uint64_t i = 0;
+    for (; i + 64 <= length; i += 64) {
+        uint64_t acc = 0;
+        for (int j = 0; j < 8; j++) {
+            uint64_t word;
+            std::memcpy(&word, bytes + i + 8 * j, sizeof(word));
+            acc |= word;
+        }
+        if (acc != 0) {
+            return false;
+        }
+    }
+    for (; i < length; i++) {
+        if (bytes[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// What the kernel says of a page of linear memory (/proc/self/pagemap, which
+// needs no privilege for these bits): never touched (zero, nothing to do);
+// written (present, and mapped by this process alone -- anonymous memory
+// written to); mapped but shared, as only read pages are (the zero page);
+// or on swap.
+enum class LinearPage
+{
+    Untouched,
+    Written,
+    Shared,
+    Swapped,
+};
+
+static constexpr uint64_t PAGEMAP_PRESENT = 1ULL << 63;
+static constexpr uint64_t PAGEMAP_SWAP = 1ULL << 62;
+static constexpr uint64_t PAGEMAP_EXCLUSIVE = 1ULL << 56;
+// Pages read from pagemap at a time.
+static constexpr uint64_t PAGEMAP_CHUNK_PAGES = 8192;
+
+static LinearPage linearPage(uint64_t entry)
+{
+    if ((entry & PAGEMAP_PRESENT) != 0) {
+        return (entry & PAGEMAP_EXCLUSIVE) != 0 ? LinearPage::Written
+                                                : LinearPage::Shared;
+    }
+    return (entry & PAGEMAP_SWAP) != 0 ? LinearPage::Swapped
+                                       : LinearPage::Untouched;
+}
+
+// The pagemap entries of `pages` pages from `start`, into `out`; false if
+// they cannot be read.
+static bool readPagemap(const uint8_t* start,
+                        uint64_t pages,
+                        std::vector<uint64_t>& out)
+{
+    static const int fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    const uint64_t pageSize = static_cast<uint64_t>(getpagesize());
+    out.resize(pages);
+    auto* dst = reinterpret_cast<uint8_t*>(out.data());
+    const uint64_t want = pages * sizeof(uint64_t);
+    const uint64_t from =
+      reinterpret_cast<uintptr_t>(start) / pageSize * sizeof(uint64_t);
+    uint64_t got = 0;
+    while (got < want) {
+        ssize_t n = pread(fd, dst + got, want - got, from + got);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            return false;
+        }
+        got += static_cast<uint64_t>(n);
+    }
+    return true;
+}
 
 // WAMR maintains some global state, which we must be careful not to modify
 // concurrently from our side. We are deliberately cautious with this locking,
@@ -190,7 +278,6 @@ void WAMRWasmModule::reset(faabric::Message& msg,
     // every other executor's -- and so do the page faults of the ones
     // running meanwhile. Restoring touches no mapping.
     if (faabric::executor::lightResetEnabled() && tryLightReset()) {
-        faabric::scheduler::getScheduler().countLightReset();
         return;
     }
 
@@ -214,22 +301,37 @@ void WAMRWasmModule::captureCleanImage()
         return;
     }
 
-    // Memory up to its last non-zero page: the rest of a fresh instance's
-    // memory is zero, and a reset can zero it by dropping its pages.
+    // The non-zero pages of memory, in runs. The rest of a fresh instance's
+    // memory is zero -- with --stack-first, the whole stack below the data
+    // (4 MiB of the 4.06 MiB the stream functions start with) -- and a
+    // reset only zeroes what the run touched of it.
     const uint64_t pageSize = static_cast<uint64_t>(getpagesize());
     const uint64_t memorySize = mem->memory_data_size;
     const uint8_t* base = mem->memory_data;
-    uint64_t usedBytes = 0;
+    // Only pages instantiation touched can be non-zero, so only those are
+    // read: reading the others would map them all to the zero page for
+    // nothing. Without pagemap, all are read.
+    const uint64_t pages = (memorySize + pageSize - 1) / pageSize;
+    std::vector<uint64_t> entries;
+    if (!readPagemap(base, pages, entries)) {
+        entries.assign(pages, PAGEMAP_PRESENT);
+    }
     for (uint64_t offset = 0; offset < memorySize; offset += pageSize) {
         uint64_t length = std::min(pageSize, memorySize - offset);
-        const uint8_t* page = base + offset;
-        bool zero =
-          page[0] == 0 && std::memcmp(page, page + 1, length - 1) == 0;
-        if (!zero) {
-            usedBytes = offset + length;
+        if (linearPage(entries[offset / pageSize]) == LinearPage::Untouched ||
+            isZeroBytes(base + offset, length)) {
+            continue;
         }
+        auto& runs = cleanImage.runs;
+        if (!runs.empty() &&
+            runs.back().offset + runs.back().length == offset) {
+            runs.back().length += length;
+        } else {
+            runs.push_back({ offset, length, cleanImage.data.size() });
+        }
+        cleanImage.data.insert(
+          cleanImage.data.end(), base + offset, base + offset + length);
     }
-    cleanImage.memory.assign(base, base + usedBytes);
     cleanImage.memorySize = memorySize;
     cleanImage.pageCount = mem->cur_page_count;
     cleanImage.bytesPerPage = mem->num_bytes_per_page;
@@ -249,12 +351,13 @@ void WAMRWasmModule::captureCleanImage()
     }
 
     cleanImage.valid = true;
-    SPDLOG_DEBUG("WAMR clean image of {}/{}: {} of {} memory bytes, {} global "
-                 "bytes, {} tables",
+    SPDLOG_DEBUG("WAMR clean image of {}/{}: {} of {} memory bytes in {} "
+                 "runs, {} global bytes, {} tables",
                  boundUser,
                  boundFunction,
-                 usedBytes,
+                 cleanImage.data.size(),
                  memorySize,
+                 cleanImage.runs.size(),
                  cleanImage.globals.size(),
                  cleanImage.tables.size());
 }
@@ -289,17 +392,42 @@ bool WAMRWasmModule::tryLightReset()
         return false;
     }
 
-    // Memory: what was non-zero copied back, the rest -- grown pages too --
-    // zeroed by dropping its pages (they fault back in as zero pages).
-    // Neither changes a mapping.
+    // Memory: the non-zero runs copied back; between and after them --
+    // grown pages too -- what the run touched zeroed in place and kept, up
+    // to a budget, and dropped past it (it faults back in as zero pages).
+    // None of it changes a mapping.
     uint8_t* base = mem->memory_data;
-    uint64_t copied = cleanImage.memory.size();
     uint64_t usedSize = mem->memory_data_size;
-    if (copied > 0) {
-        std::memcpy(base, cleanImage.memory.data(), copied);
+    bool grew = usedSize > cleanImage.memorySize;
+    uint64_t copiedBytes = 0;
+    uint64_t zeroedBytes = 0;
+    uint64_t droppedBytes = 0;
+    uint64_t keepBudget = LIGHT_RESET_KEEP_BYTES;
+    uint64_t cursor = 0;
+    bool zeroed = true;
+    for (const auto& run : cleanImage.runs) {
+        zeroed = zeroLinearRange(base + cursor,
+                                 run.offset - cursor,
+                                 keepBudget,
+                                 zeroedBytes,
+                                 droppedBytes);
+        if (!zeroed) {
+            break;
+        }
+        std::memcpy(base + run.offset,
+                    cleanImage.data.data() + run.dataOffset,
+                    run.length);
+        copiedBytes += run.length;
+        cursor = run.offset + run.length;
     }
-    if (copied < usedSize &&
-        madvise(base + copied, usedSize - copied, MADV_DONTNEED) != 0) {
+    if (zeroed) {
+        zeroed = zeroLinearRange(base + cursor,
+                                 usedSize - cursor,
+                                 keepBudget,
+                                 zeroedBytes,
+                                 droppedBytes);
+    }
+    if (!zeroed) {
         SPDLOG_WARN("WAMR light reset of {}/{} could not drop pages ({}), "
                     "re-instantiating",
                     boundUser,
@@ -342,7 +470,108 @@ bool WAMRWasmModule::tryLightReset()
     wasm_runtime_clear_exception(moduleInstance);
     wasm_runtime_get_wasi_ctx(moduleInstance)->exit_code = 0;
     currentBrk.store(getMemorySizeBytes(), std::memory_order_release);
+
+    faabric::scheduler::getScheduler().countLightReset(
+      static_cast<int64_t>(copiedBytes),
+      static_cast<int64_t>(zeroedBytes),
+      static_cast<int64_t>(droppedBytes),
+      grew);
     return true;
+}
+
+bool WAMRWasmModule::zeroLinearRange(uint8_t* start,
+                                     uint64_t length,
+                                     uint64_t& keepBudget,
+                                     uint64_t& zeroedBytes,
+                                     uint64_t& droppedBytes)
+{
+    if (length == 0) {
+        return true;
+    }
+    const uint64_t pageSize = static_cast<uint64_t>(getpagesize());
+    // Linear memory and the runs are page-aligned; anything else is zeroed
+    // as it is.
+    if (reinterpret_cast<uintptr_t>(start) % pageSize != 0 ||
+        length % pageSize != 0) {
+        std::memset(start, 0, length);
+        zeroedBytes += length;
+        return true;
+    }
+
+    // Which pages the run touched, from pagemap (read under the memory-map
+    // lock taken shared, as a page fault takes it). Without it, all of the
+    // range is dropped.
+    const uint64_t pages = length / pageSize;
+    // Pages to drop, gathered into one range while they are consecutive.
+    uint8_t* dropStart = nullptr;
+    uint64_t dropBytes = 0;
+    auto flushDrop = [&]() {
+        if (dropBytes == 0) {
+            return true;
+        }
+        bool dropped = madvise(dropStart, dropBytes, MADV_DONTNEED) == 0;
+        dropBytes = 0;
+        return dropped;
+    };
+    for (uint64_t chunk = 0; chunk < pages; chunk += PAGEMAP_CHUNK_PAGES) {
+        const uint64_t chunkPages =
+          std::min(PAGEMAP_CHUNK_PAGES, pages - chunk);
+        uint8_t* chunkStart = start + chunk * pageSize;
+        if (!readPagemap(chunkStart, chunkPages, pagemapEntries)) {
+            if (!flushDrop() || madvise(chunkStart,
+                                        (pages - chunk) * pageSize,
+                                        MADV_DONTNEED) != 0) {
+                return false;
+            }
+            droppedBytes += (pages - chunk) * pageSize;
+            return true;
+        }
+        for (uint64_t i = 0; i < chunkPages; i++) {
+            uint8_t* page = chunkStart + i * pageSize;
+            bool drop = false;
+            switch (linearPage(pagemapEntries[i])) {
+                case LinearPage::Untouched:
+                    break;
+                case LinearPage::Shared:
+                    // Only read (the zero page), or shared some other way:
+                    // dropping it makes it zero again without reading it,
+                    // and it stays untouched until read again.
+                    drop = true;
+                    droppedBytes += pageSize;
+                    break;
+                case LinearPage::Written:
+                    // Zeroed in place and kept up to the budget, dropped
+                    // past it.
+                    if (keepBudget >= pageSize) {
+                        keepBudget -= pageSize;
+                        if (!isZeroBytes(page, pageSize)) {
+                            std::memset(page, 0, pageSize);
+                            zeroedBytes += pageSize;
+                        }
+                    } else {
+                        drop = true;
+                        droppedBytes += pageSize;
+                    }
+                    break;
+                case LinearPage::Swapped:
+                    // Dropping it zeroes it without reading it back in.
+                    drop = true;
+                    break;
+            }
+            if (drop) {
+                if (dropBytes > 0 && dropStart + dropBytes == page) {
+                    dropBytes += pageSize;
+                } else {
+                    if (!flushDrop()) {
+                        return false;
+                    }
+                    dropStart = page;
+                    dropBytes = pageSize;
+                }
+            }
+        }
+    }
+    return flushDrop();
 }
 
 void WAMRWasmModule::doBindToFunction(faabric::Message& msg, bool cache)

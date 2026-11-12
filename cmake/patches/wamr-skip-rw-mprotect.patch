@@ -1,0 +1,183 @@
+diff --git a/core/iwasm/common/wasm_memory.c b/core/iwasm/common/wasm_memory.c
+index 3941c224..529dbdff 100644
+--- a/core/iwasm/common/wasm_memory.c
++++ b/core/iwasm/common/wasm_memory.c
+@@ -826,9 +826,9 @@ wasm_enlarge_memory_internal(WASMModuleInstance *module, uint32 inc_page_count)
+     }
+ #endif
+ 
+-    if (os_mprotect(memory->memory_data_end,
+-                    (uint32)total_size_new - total_size_old,
+-                    MMAP_PROT_READ | MMAP_PROT_WRITE)
++    /* faasm: only what is not readable and writable yet is mprotected */
++    if (wasm_commit_linear_memory(memory->memory_data, total_size_old,
++                                  (uint32)total_size_new)
+         != 0) {
+ #ifdef BH_PLATFORM_WINDOWS
+         os_mem_decommit(memory->memory_data_end,
+diff --git a/core/iwasm/common/wasm_runtime_common.c b/core/iwasm/common/wasm_runtime_common.c
+index 4434a2a0..0a8d4bd7 100644
+--- a/core/iwasm/common/wasm_runtime_common.c
++++ b/core/iwasm/common/wasm_runtime_common.c
+@@ -6266,6 +6266,123 @@ wasm_runtime_set_linux_perf(bool flag)
+ }
+ #endif
+ 
++#if defined(OS_ENABLE_HW_BOUND_CHECK) && defined(BH_PLATFORM_LINUX)
++/* faasm: for each mapping of linear memory, how much of it from the start is
++ * readable and writable. A memory's size only grows in WAMR, but an embedder
++ * may shrink it in place -- faasm's light reset puts an instance back to its
++ * first size without unmapping anything -- leaving the pages past the new
++ * size readable and writable. Growing over them again then needs no
++ * mprotect, which takes the process-wide memory-map lock for writing and so
++ * stalls every page fault of every other instance meanwhile. A mapping is
++ * entered when mapped and removed when unmapped; one not found (an entry
++ * that could not be allocated) is mprotected as before. */
++typedef struct LinearMemoryRW {
++    void *base;
++    uint64 rw_size;
++} LinearMemoryRW;
++
++static korp_mutex linear_memory_rw_lock = PTHREAD_MUTEX_INITIALIZER;
++static LinearMemoryRW *linear_memory_rw = NULL;
++static uint32 linear_memory_rw_count = 0;
++static uint32 linear_memory_rw_capacity = 0;
++
++/* Caller holds linear_memory_rw_lock. */
++static LinearMemoryRW *
++linear_memory_rw_find(void *base)
++{
++    uint32 i;
++    for (i = 0; i < linear_memory_rw_count; i++) {
++        if (linear_memory_rw[i].base == base)
++            return &linear_memory_rw[i];
++    }
++    return NULL;
++}
++
++static void
++linear_memory_rw_enter(void *base, uint64 rw_size)
++{
++    LinearMemoryRW *entry;
++
++    os_mutex_lock(&linear_memory_rw_lock);
++    entry = linear_memory_rw_find(base);
++    if (!entry) {
++        if (linear_memory_rw_count == linear_memory_rw_capacity) {
++            uint32 capacity =
++                linear_memory_rw_capacity ? linear_memory_rw_capacity * 2 : 64;
++            LinearMemoryRW *grown = (LinearMemoryRW *)os_realloc(
++                linear_memory_rw, capacity * sizeof(LinearMemoryRW));
++            if (!grown) {
++                os_mutex_unlock(&linear_memory_rw_lock);
++                return;
++            }
++            linear_memory_rw = grown;
++            linear_memory_rw_capacity = capacity;
++        }
++        entry = &linear_memory_rw[linear_memory_rw_count++];
++        entry->base = base;
++    }
++    entry->rw_size = rw_size;
++    os_mutex_unlock(&linear_memory_rw_lock);
++}
++
++static void
++linear_memory_rw_remove(void *base)
++{
++    LinearMemoryRW *entry;
++
++    os_mutex_lock(&linear_memory_rw_lock);
++    entry = linear_memory_rw_find(base);
++    if (entry) {
++        *entry = linear_memory_rw[--linear_memory_rw_count];
++        if (linear_memory_rw_count == 0) {
++            os_free(linear_memory_rw);
++            linear_memory_rw = NULL;
++            linear_memory_rw_capacity = 0;
++        }
++    }
++    os_mutex_unlock(&linear_memory_rw_lock);
++}
++
++int
++wasm_commit_linear_memory(void *mapped_mem, uint64 old_size, uint64 new_size)
++{
++    LinearMemoryRW *entry;
++    uint64 from = old_size;
++    bool known;
++
++    os_mutex_lock(&linear_memory_rw_lock);
++    entry = linear_memory_rw_find(mapped_mem);
++    known = entry != NULL;
++    if (known && entry->rw_size > from)
++        from = entry->rw_size;
++    os_mutex_unlock(&linear_memory_rw_lock);
++
++    if (new_size > from
++        && os_mprotect((uint8 *)mapped_mem + from, new_size - from,
++                       MMAP_PROT_READ | MMAP_PROT_WRITE)
++               != 0)
++        return -1;
++
++    if (known) {
++        os_mutex_lock(&linear_memory_rw_lock);
++        entry = linear_memory_rw_find(mapped_mem);
++        if (entry && entry->rw_size < new_size)
++            entry->rw_size = new_size;
++        os_mutex_unlock(&linear_memory_rw_lock);
++    }
++    return 0;
++}
++#else
++int
++wasm_commit_linear_memory(void *mapped_mem, uint64 old_size, uint64 new_size)
++{
++    if (new_size <= old_size)
++        return 0;
++    return os_mprotect((uint8 *)mapped_mem + old_size, new_size - old_size,
++                       MMAP_PROT_READ | MMAP_PROT_WRITE);
++}
++#endif
++
+ #ifdef WASM_LINEAR_MEMORY_MMAP
+ void
+ wasm_munmap_linear_memory(void *mapped_mem, uint64 commit_size, uint64 map_size)
+@@ -6274,6 +6391,9 @@ wasm_munmap_linear_memory(void *mapped_mem, uint64 commit_size, uint64 map_size)
+     os_mem_decommit(mapped_mem, commit_size);
+ #else
+     (void)commit_size;
++#endif
++#if defined(OS_ENABLE_HW_BOUND_CHECK) && defined(BH_PLATFORM_LINUX)
++    linear_memory_rw_remove(mapped_mem);
+ #endif
+     os_munmap(mapped_mem, map_size);
+ }
+@@ -6320,6 +6440,10 @@ wasm_mmap_linear_memory(uint64_t map_size, uint64 *io_memory_data_size,
+     /* Newly allocated pages are filled with zero by the OS, we don't fill it
+      * again here */
+ 
++#if defined(OS_ENABLE_HW_BOUND_CHECK) && defined(BH_PLATFORM_LINUX)
++    linear_memory_rw_enter(mapped_mem, memory_data_size);
++#endif
++
+     *io_memory_data_size = memory_data_size;
+ 
+     return mapped_mem;
+diff --git a/core/iwasm/common/wasm_runtime_common.h b/core/iwasm/common/wasm_runtime_common.h
+index 039244ff..235dad7e 100644
+--- a/core/iwasm/common/wasm_runtime_common.h
++++ b/core/iwasm/common/wasm_runtime_common.h
+@@ -1106,6 +1106,12 @@ void *
+ wasm_mmap_linear_memory(uint64_t map_size, uint64 *io_memory_data_size,
+                         char *error_buf, uint32 error_buf_size);
+ 
++/* faasm: makes [old_size, new_size) of the linear memory mapped at
++ * mapped_mem readable and writable, skipping what already is (see
++ * wasm_runtime_common.c). Returns 0 on success, as os_mprotect. */
++int
++wasm_commit_linear_memory(void *mapped_mem, uint64 old_size, uint64 new_size);
++
+ #if WASM_ENABLE_LOAD_CUSTOM_SECTION != 0
+ void
+ wasm_runtime_destroy_custom_sections(WASMCustomSection *section_list);

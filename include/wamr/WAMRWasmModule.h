@@ -134,15 +134,25 @@ class WAMRWasmModule final
     bool doGrowMemory(uint32_t pageChange) override;
 
     // Light reset (faabric::executor::lightResetEnabled): the instance as it
-    // was right after instantiation -- linear memory up to its last non-zero
-    // page (the rest was zero), memory size, global data and tables -- so
+    // was right after instantiation -- the non-zero pages of linear memory
+    // (everything else was zero), memory size, global data and tables -- so
     // that a reset can put it back in place instead of re-instantiating the
     // module. Taken once, on the first instantiation with light reset on:
     // every instance of the module starts out the same.
     struct CleanImage
     {
+        // A run of non-zero pages: where it starts in linear memory, how
+        // long it is, and where its bytes start in `data`.
+        struct Run
+        {
+            uint64_t offset = 0;
+            uint64_t length = 0;
+            uint64_t dataOffset = 0;
+        };
+
         bool valid = false;
-        std::vector<uint8_t> memory;
+        std::vector<Run> runs;
+        std::vector<uint8_t> data;
         uint64_t memorySize = 0;
         uint32_t pageCount = 0;
         uint32_t bytesPerPage = 0;
@@ -159,6 +169,20 @@ class WAMRWasmModule final
     // matters, if it cannot: no image, a table that changed size, or a run
     // that ended in an exception other than a normal exit.
     bool tryLightReset();
+
+    // Makes [start, start + length) of linear memory zero again (light
+    // reset): pages the run wrote are zeroed in place and kept, up to
+    // `keepBudget` bytes over the whole reset; past that they are dropped.
+    // Adds to the byte counts what it zeroed and dropped. False if a drop
+    // failed.
+    bool zeroLinearRange(uint8_t* start,
+                         uint64_t length,
+                         uint64_t& keepBudget,
+                         uint64_t& zeroedBytes,
+                         uint64_t& droppedBytes);
+
+    // Scratch for the pagemap entries read in zeroLinearRange.
+    std::vector<uint64_t> pagemapEntries;
 };
 
 WAMRWasmModule* getExecutingWAMRModule();

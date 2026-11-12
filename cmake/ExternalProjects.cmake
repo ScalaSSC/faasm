@@ -98,9 +98,16 @@ FetchContent_Declare(wavm_ext
         -DDLL_IMPORT="
 )
 
+# Runtime-only patch (no struct layout changes, so AOT files built for this
+# commit keep working): growing linear memory over pages that are already
+# readable and writable skips mprotect. Applied once; a tree that already has
+# it is left as it is.
+set(FAASM_WAMR_PATCH
+    "${CMAKE_CURRENT_LIST_DIR}/patches/wamr-skip-rw-mprotect.patch")
 FetchContent_Declare(wamr_ext
     GIT_REPOSITORY "https://github.com/faasm/wasm-micro-runtime"
     GIT_TAG "c3a833acb51ba1c8d98aad7fceb69829c96c4eee"
+    PATCH_COMMAND sh -c "git apply --reverse --check ${FAASM_WAMR_PATCH} 2>/dev/null || git apply ${FAASM_WAMR_PATCH}"
 )
 
 # WAMR and WAVM both link to LLVM
